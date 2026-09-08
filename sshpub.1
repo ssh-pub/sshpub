@@ -1,0 +1,72 @@
+.TH SSHPUB 1 "September 2026" "sshpub 0.1.1" "User Commands"
+.SH NAME
+sshpub \- download and manage SSH Pub public keys in authorized_keys
+.SH SYNOPSIS
+.B sshpub add
+.I user
+.br
+.B sshpub add
+.I user/device[,device...]
+.br
+.B sshpub remove
+.I user
+.br
+.B sshpub remove
+.I user/device[,device...]
+.br
+.B sshpub list
+.br
+.B sshpub version
+.br
+.B sshpub upgrade
+.SH DESCRIPTION
+SSH Pub is a lightweight SSH public key management and distribution tool.
+The CLI downloads public keys from SSH Pub, validates them, deduplicates them,
+and safely writes them to the current user's authorized_keys file.
+.PP
+SSH Pub never reads or stores private keys.
+.SH COMMANDS
+.TP
+.B add user
+Download all enabled public keys for the user and add any missing keys.
+.TP
+.B add user/device[,device...]
+Download one or more device keys. The server must not return keys for devices
+that were not requested.
+.TP
+.B remove user
+Remove all local SSH Pub-managed keys for the user.
+.TP
+.B remove user/device[,device...]
+Remove local SSH Pub-managed keys for the selected devices.
+.TP
+.B list
+List all valid public keys in authorized_keys and label them as SSHPUB or LOCAL.
+.TP
+.B version
+Print the sshpub version.
+.TP
+.B upgrade
+Ask SSH Pub whether a newer version is available. This command only runs when
+the user invokes it, and it prints upgrade instructions without replacing the
+binary.
+.SH SECURITY
+The CLI validates downloaded keys with golang.org/x/crypto/ssh, rejects
+authorized_keys options, accepts only allowlisted ordinary SSH public key
+algorithms, rejects OpenSSH certificates, verifies SSH Pub comments, and writes
+authorized_keys atomically only after all validation succeeds.
+.PP
+The CLI does not provide SSH login, run a daemon or agent, collect telemetry,
+automatically check for updates, automatically update itself, or modify sshd
+configuration.
+.SH FILES
+.TP
+.I ~/.ssh/authorized_keys
+The authorized_keys file read and modified by sshpub.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure.
