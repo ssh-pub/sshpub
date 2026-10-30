@@ -25,6 +25,7 @@ const (
 	baseURL             = "https://keys.sshpub.com"
 	upgradeAPIBaseURL   = "https://sshpub.com"
 	maxResponseBodySize = 256 * 1024
+	maxProviderPages    = 100
 )
 
 //go:embed VERSION
@@ -33,8 +34,12 @@ var versionFile string
 var (
 	usernamePattern    = regexp.MustCompile(`^[a-z0-9-]{1,16}$`)
 	devicePattern      = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+	githubUserPattern  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$`)
+	gitlabUserPattern  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,253}[a-z0-9])$`)
 	version            = strings.TrimSpace(versionFile)
-	installSource      = "direct"
+	installSource      = "external"
+	githubAPIBaseURL   = "https://api.github.com"
+	gitlabAPIBaseURL   = "https://gitlab.com/api/v4"
 	errRemoveCancelled = errors.New("remove cancelled")
 )
 
@@ -49,6 +54,7 @@ var allowedAlgorithms = map[string]struct{}{
 }
 
 type target struct {
+	Source   string
 	Username string
 	Devices  []string
 }
@@ -68,8 +74,9 @@ type keyLine struct {
 }
 
 type addResult struct {
-	Added  []string
-	Exists []string
+	Added   []string
+	Exists  []string
+	Updated []string
 }
 
 type removeOptions struct {
@@ -82,8 +89,21 @@ type removeOptions struct {
 type removePlan struct {
 	Kept                []string
 	Removed             []string
+	RemovedKeys         []*publicKey
 	RemainingValidKeys  int
 	WouldRemoveAnyValid bool
+}
+
+type githubKeyItem struct {
+	ID  int64  `json:"id"`
+	Key string `json:"key"`
+}
+
+type gitlabKeyItem struct {
+	ID        int64  `json:"id"`
+	Title     string `json:"title"`
+	Key       string `json:"key"`
+	UsageType string `json:"usage_type"`
 }
 
 type apiKeyResponse struct {
@@ -134,7 +154,7 @@ func run(args []string, stdout, stderr io.Writer, pathFunc func() (string, error
 		return runUpgrade(ctx, http.DefaultClient, stdout, upgradeAPIBaseURL)
 	case "add":
 		if len(args) != 2 {
-			return errors.New("usage: sshpub add <user|user/device[,device...]>")
+			return errors.New("usage: sshpub add <user|user/device[,device...]|github/user|gitlab/user>")
 		}
 		t, err := parseTarget(args[1])
 		if err != nil {
@@ -157,14 +177,14 @@ func run(args []string, stdout, stderr io.Writer, pathFunc func() (string, error
 		return listKeys(stdout, path)
 	case "remove":
 		if len(args) < 2 || len(args) > 3 {
-			return errors.New("usage: sshpub remove <user|user/device[,device...]> [--force]")
+			return errors.New("usage: sshpub remove <user|user/device[,device...]|github/user|gitlab/user> [-y|--yes]")
 		}
-		force := false
+		yes := false
 		if len(args) == 3 {
-			if args[2] != "--force" {
-				return errors.New("usage: sshpub remove <user|user/device[,device...]> [--force]")
+			if args[2] != "-y" && args[2] != "--yes" {
+				return errors.New("usage: sshpub remove <user|user/device[,device...]|github/user|gitlab/user> [-y|--yes]")
 			}
-			force = true
+			yes = true
 		}
 		t, err := parseTarget(args[1])
 		if err != nil {
@@ -175,7 +195,7 @@ func run(args []string, stdout, stderr io.Writer, pathFunc func() (string, error
 			return err
 		}
 		removed, err := removeKeysWithOptions(path, t, removeOptions{
-			Force:       force,
+			Force:       yes,
 			Confirm:     os.Stdin,
 			Prompt:      stdout,
 			Interactive: isInteractive(os.Stdin),
@@ -211,9 +231,13 @@ func printHelp(w io.Writer) {
 Usage:
   sshpub add <user>
   sshpub add <user>/<device[,device...]>
+  sshpub add github/<user>
+  sshpub add gitlab/<user>
 
-  sshpub remove <user>
-  sshpub remove <user>/<device[,device...]>
+  sshpub remove <user> [-y|--yes]
+  sshpub remove <user>/<device[,device...]> [-y|--yes]
+  sshpub remove github/<user> [-y|--yes]
+  sshpub remove gitlab/<user> [-y|--yes]
 
   sshpub list
   sshpub version
@@ -229,9 +253,11 @@ type upgradeResponse struct {
 }
 
 func runUpgrade(ctx context.Context, client *http.Client, stdout io.Writer, apiBase string) error {
-	if installSource == "package" {
-		fmt.Fprintln(stdout, "This installation is managed by your package manager.")
-		fmt.Fprintln(stdout, "Use your system package manager to upgrade sshpub.")
+	if installSource == "external" {
+		fmt.Fprintln(stdout, "This build is not managed by SSH Pub.")
+		fmt.Fprintln(stdout, "Upgrade it using the same method you used to install it.")
+		fmt.Fprintln(stdout)
+		fmt.Fprintln(stdout, "More information: https://sshpub.com")
 		return nil
 	}
 	if installSource != "direct" {
@@ -293,6 +319,18 @@ func parseTarget(value string) (target, error) {
 	if len(parts) > 2 {
 		return target{}, errors.New("invalid target")
 	}
+	if parts[0] == "github" || parts[0] == "gitlab" {
+		if len(parts) != 2 || strings.Contains(parts[1], ",") {
+			return target{}, errors.New("invalid target")
+		}
+		if parts[0] == "github" && !isValidGitHubUsername(parts[1]) {
+			return target{}, errors.New("invalid username")
+		}
+		if parts[0] == "gitlab" && !isValidGitLabUsername(parts[1]) {
+			return target{}, errors.New("invalid username")
+		}
+		return target{Source: parts[0], Username: parts[1]}, nil
+	}
 	if !usernamePattern.MatchString(parts[0]) {
 		return target{}, errors.New("invalid username")
 	}
@@ -316,6 +354,9 @@ func parseTarget(value string) (target, error) {
 }
 
 func addKeys(ctx context.Context, client *http.Client, apiBase, path string, t target) (addResult, error) {
+	if t.Source == "github" || t.Source == "gitlab" {
+		return addProviderKeys(ctx, client, path, t)
+	}
 	body, err := downloadKeys(ctx, client, apiBase, t)
 	if err != nil {
 		return addResult{}, err
@@ -332,6 +373,93 @@ func addKeys(ctx context.Context, client *http.Client, apiBase, path string, t t
 		return addResult{}, err
 	}
 	existing := make(map[string]struct{})
+	commentIndexes := make(map[string][]int)
+	for i, line := range current {
+		if line.Key != nil {
+			existing[line.Key.Identity] = struct{}{}
+			if username, device, ok := splitSSHComment(line.Key.Comment); ok {
+				commentIndexes[sshpubComment(username, device)] = append(commentIndexes[sshpubComment(username, device)], i)
+			}
+		}
+	}
+	result := addResult{}
+	var additions []string
+	removeIndexes := make(map[int]struct{})
+	replaceIndexes := make(map[int]string)
+	for _, key := range keys {
+		name := t.Username + "/" + key.Device
+		comment := sshpubComment(t.Username, key.Device)
+		indexes := commentIndexes[comment]
+		if _, ok := existing[key.Identity]; ok {
+			result.Exists = append(result.Exists, name)
+			for _, index := range indexes {
+				if current[index].Key != nil && current[index].Key.Identity != key.Identity {
+					removeIndexes[index] = struct{}{}
+					result.Updated = append(result.Updated, name)
+				}
+			}
+			continue
+		}
+		existing[key.Identity] = struct{}{}
+		if len(indexes) > 0 {
+			first := indexes[0]
+			replaceIndexes[first] = key.Line
+			for _, index := range indexes[1:] {
+				removeIndexes[index] = struct{}{}
+			}
+			result.Updated = append(result.Updated, name)
+			continue
+		}
+		result.Added = append(result.Added, name)
+		additions = append(additions, key.Line)
+	}
+	if len(additions) == 0 && len(replaceIndexes) == 0 && len(removeIndexes) == 0 {
+		return result, nil
+	}
+	original, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return addResult{}, err
+	}
+	var next []byte
+	if len(replaceIndexes) == 0 && len(removeIndexes) == 0 {
+		next = appendAuthorizedKeyLines(original, additions)
+	} else {
+		lines := make([]string, 0, len(current)+len(additions))
+		for i, line := range current {
+			if replacement, ok := replaceIndexes[i]; ok {
+				lines = append(lines, replacement)
+				continue
+			}
+			if _, ok := removeIndexes[i]; ok {
+				continue
+			}
+			lines = append(lines, line.Raw)
+		}
+		lines = append(lines, additions...)
+		next = []byte(strings.Join(lines, "\n"))
+		if len(lines) > 0 {
+			next = append(next, '\n')
+		}
+	}
+	if err := writeAtomic(path, next); err != nil {
+		return addResult{}, err
+	}
+	return result, nil
+}
+
+func addProviderKeys(ctx context.Context, client *http.Client, path string, t target) (addResult, error) {
+	keys, err := fetchProviderKeys(ctx, client, t)
+	if err != nil {
+		return addResult{}, err
+	}
+	if len(keys) == 0 {
+		return addResult{}, fmt.Errorf("No SSH public keys found for %s/%s", t.Source, t.Username)
+	}
+	current, err := readAuthorizedKeys(path)
+	if err != nil {
+		return addResult{}, err
+	}
+	existing := make(map[string]struct{})
 	for _, line := range current {
 		if line.Key != nil {
 			existing[line.Key.Identity] = struct{}{}
@@ -339,13 +467,14 @@ func addKeys(ctx context.Context, client *http.Client, apiBase, path string, t t
 	}
 	result := addResult{}
 	var additions []string
+	name := t.Source + "/" + t.Username
 	for _, key := range keys {
 		if _, ok := existing[key.Identity]; ok {
-			result.Exists = append(result.Exists, t.Username+"/"+key.Device)
+			result.Exists = append(result.Exists, name)
 			continue
 		}
 		existing[key.Identity] = struct{}{}
-		result.Added = append(result.Added, t.Username+"/"+key.Device)
+		result.Added = append(result.Added, name)
 		additions = append(additions, key.Line)
 	}
 	if len(additions) == 0 {
@@ -355,8 +484,7 @@ func addKeys(ctx context.Context, client *http.Client, apiBase, path string, t t
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return addResult{}, err
 	}
-	next := appendAuthorizedKeyLines(original, additions)
-	if err := writeAtomic(path, next); err != nil {
+	if err := writeAtomic(path, appendAuthorizedKeyLines(original, additions)); err != nil {
 		return addResult{}, err
 	}
 	return result, nil
@@ -388,6 +516,172 @@ func downloadKeys(ctx context.Context, client *http.Client, apiBase string, t ta
 		return nil, fmt.Errorf("sshpub server returned HTTP %d", resp.StatusCode)
 	}
 	return body, nil
+}
+
+func fetchProviderKeys(ctx context.Context, client *http.Client, t target) ([]*publicKey, error) {
+	var rawKeys []string
+	nextURL := providerKeysURL(t, 1)
+	for page := 1; page <= maxProviderPages && nextURL != ""; page++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", providerUserAgent())
+		if t.Source == "github" {
+			req.Header.Set("Accept", "application/vnd.github+json")
+			req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, readErr := readLimitedResponse(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return nil, fmt.Errorf("%s returned HTTP %d", providerDisplayName(t.Source), resp.StatusCode)
+		}
+		pageKeys, err := parseProviderResponse(t, body)
+		if err != nil {
+			return nil, err
+		}
+		rawKeys = append(rawKeys, pageKeys...)
+		nextURL = nextProviderPageURL(t, resp.Header, page+1)
+	}
+	if nextURL != "" {
+		return nil, fmt.Errorf("%s pagination exceeded %d pages", providerDisplayName(t.Source), maxProviderPages)
+	}
+	return parseProviderKeys(rawKeys, t)
+}
+
+func providerKeysURL(t target, page int) string {
+	base := githubAPIBaseURL
+	pathPrefix := "/users/"
+	if t.Source == "gitlab" {
+		base = gitlabAPIBaseURL
+		pathPrefix = "/users/"
+	}
+	u := strings.TrimRight(base, "/") + pathPrefix + url.PathEscape(t.Username) + "/keys"
+	values := url.Values{}
+	values.Set("per_page", "100")
+	values.Set("page", fmt.Sprintf("%d", page))
+	return u + "?" + values.Encode()
+}
+
+func nextProviderPageURL(t target, header http.Header, nextPage int) string {
+	if linkNext := nextLinkURL(header.Get("Link")); linkNext != "" {
+		return linkNext
+	}
+	if t.Source == "gitlab" {
+		if value := strings.TrimSpace(header.Get("X-Next-Page")); value != "" {
+			return providerKeysURL(t, nextPage)
+		}
+	}
+	return ""
+}
+
+func nextLinkURL(header string) string {
+	for _, part := range strings.Split(header, ",") {
+		sections := strings.Split(part, ";")
+		if len(sections) < 2 {
+			continue
+		}
+		if strings.TrimSpace(sections[1]) != `rel="next"` {
+			continue
+		}
+		value := strings.TrimSpace(sections[0])
+		if strings.HasPrefix(value, "<") && strings.HasSuffix(value, ">") {
+			return strings.TrimSuffix(strings.TrimPrefix(value, "<"), ">")
+		}
+	}
+	return ""
+}
+
+func readLimitedResponse(r io.Reader) ([]byte, error) {
+	limited := &io.LimitedReader{R: r, N: maxResponseBodySize + 1}
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxResponseBodySize {
+		return nil, errors.New("server response exceeds 256 KiB")
+	}
+	return body, nil
+}
+
+func parseProviderResponse(t target, body []byte) ([]string, error) {
+	switch t.Source {
+	case "github":
+		var items []githubKeyItem
+		if err := json.Unmarshal(body, &items); err != nil {
+			return nil, errors.New("invalid JSON returned by GitHub")
+		}
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			if strings.TrimSpace(item.Key) != "" {
+				out = append(out, item.Key)
+			}
+		}
+		return out, nil
+	case "gitlab":
+		var items []gitlabKeyItem
+		if err := json.Unmarshal(body, &items); err != nil {
+			return nil, errors.New("invalid JSON returned by GitLab")
+		}
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			usage := strings.ToLower(strings.TrimSpace(item.UsageType))
+			switch usage {
+			case "auth", "auth_and_signing":
+			case "signing":
+				continue
+			default:
+				return nil, fmt.Errorf("unexpected GitLab key usage_type: %s", item.UsageType)
+			}
+			if strings.TrimSpace(item.Key) != "" {
+				out = append(out, item.Key)
+			}
+		}
+		return out, nil
+	default:
+		return nil, errors.New("invalid provider")
+	}
+}
+
+func parseProviderKeys(rawKeys []string, t target) ([]*publicKey, error) {
+	comment := providerComment(t.Source, t.Username)
+	keys := make([]*publicKey, 0, len(rawKeys))
+	seen := make(map[string]struct{})
+	for _, raw := range rawKeys {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if len(strings.Fields(line)) != 2 {
+			return nil, fmt.Errorf("invalid SSH public key returned by %s", providerDisplayName(t.Source))
+		}
+		key, err := parsePublicKeyLine(line, false)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SSH public key returned by %s", providerDisplayName(t.Source))
+		}
+		if _, ok := seen[key.Identity]; ok {
+			continue
+		}
+		seen[key.Identity] = struct{}{}
+		key.Comment = comment
+		key.Line = key.Algorithm + " " + key.KeyData + " " + comment
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
+func providerUserAgent() string {
+	if version == "" {
+		return "sshpub"
+	}
+	return "sshpub/" + version
 }
 
 func cliUserAgent() string {
@@ -564,6 +858,50 @@ func splitSSHComment(comment string) (string, string, bool) {
 	return parts[1], parts[2], true
 }
 
+func splitProviderComment(comment string) (string, string, bool) {
+	parts := strings.Split(comment, "/")
+	if len(parts) != 3 || parts[0] != "sshpub.com" {
+		return "", "", false
+	}
+	if parts[1] != "github" && parts[1] != "gitlab" {
+		return "", "", false
+	}
+	if parts[1] == "github" && !isValidGitHubUsername(parts[2]) {
+		return "", "", false
+	}
+	if parts[1] == "gitlab" && !isValidGitLabUsername(parts[2]) {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
+}
+
+func isValidGitHubUsername(username string) bool {
+	return githubUserPattern.MatchString(username) && !strings.Contains(username, "--")
+}
+
+func isValidGitLabUsername(username string) bool {
+	return gitlabUserPattern.MatchString(username)
+}
+
+func sshpubComment(username, device string) string {
+	return "sshpub.com/" + strings.ToLower(username) + "/" + strings.ToLower(device)
+}
+
+func providerComment(source, username string) string {
+	return "sshpub.com/" + strings.ToLower(source) + "/" + strings.ToLower(username)
+}
+
+func providerDisplayName(source string) string {
+	switch source {
+	case "github":
+		return "GitHub"
+	case "gitlab":
+		return "GitLab"
+	default:
+		return strings.ToUpper(source)
+	}
+}
+
 func readAuthorizedKeys(path string) ([]keyLine, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -585,7 +923,7 @@ func readAuthorizedKeys(path string) ([]keyLine, error) {
 }
 
 func removeKeys(path string, t target) ([]string, error) {
-	return removeKeysWithOptions(path, t, removeOptions{})
+	return removeKeysWithOptions(path, t, removeOptions{Force: true})
 }
 
 func removeKeysWithOptions(path string, t target, opts removeOptions) ([]string, error) {
@@ -600,11 +938,14 @@ func removeKeysWithOptions(path string, t target, opts removeOptions) ([]string,
 	if len(plan.Removed) == 0 {
 		return nil, nil
 	}
-	if plan.WouldRemoveAnyValid && plan.RemainingValidKeys == 0 && !opts.Force {
+	if opts.Force && opts.Prompt != nil && removeLeavesNoValidKeys(plan) {
+		fmt.Fprintln(opts.Prompt, "Warning: this will leave no valid SSH keys in authorized_keys.")
+	}
+	if !opts.Force {
 		if !opts.Interactive {
-			return nil, errors.New("refusing to remove all SSH keys from authorized_keys without --force")
+			return nil, errors.New("confirmation requires an interactive terminal; use --yes to continue")
 		}
-		ok, err := confirmRemoveAllKeys(opts, path)
+		ok, err := confirmRemoveKeys(opts, t, plan)
 		if err != nil {
 			return nil, err
 		}
@@ -615,10 +956,11 @@ func removeKeysWithOptions(path string, t target, opts removeOptions) ([]string,
 			return nil, errRemoveCancelled
 		}
 	}
-	if err := writeAtomic(path, []byte(strings.Join(plan.Kept, "\n"))); err != nil {
+	if err := writeAtomic(path, joinAuthorizedKeyLines(plan.Kept)); err != nil {
 		return nil, err
 	}
-	return uniqueSorted(plan.Removed), nil
+	sort.Strings(plan.Removed)
+	return plan.Removed, nil
 }
 
 func planRemoveKeys(original []byte, t target) removePlan {
@@ -641,24 +983,118 @@ func planRemoveKeys(original []byte, t target) removePlan {
 			keepLine(line)
 			continue
 		}
-		username, device, ok := splitSSHComment(key.Comment)
-		if !ok || username != t.Username {
-			keepLine(line)
-			continue
-		}
-		if removeAllDevices {
-			plan.Removed = append(plan.Removed, username+"/"+device)
-			plan.WouldRemoveAnyValid = true
-			continue
-		}
-		if _, ok := deviceSet[device]; ok {
-			plan.Removed = append(plan.Removed, username+"/"+device)
+		if shouldRemoveKey(key, t, removeAllDevices, deviceSet) {
+			plan.Removed = append(plan.Removed, removeNameForKey(key, t))
+			plan.RemovedKeys = append(plan.RemovedKeys, key)
 			plan.WouldRemoveAnyValid = true
 			continue
 		}
 		keepLine(line)
 	}
 	return plan
+}
+
+func shouldRemoveKey(key *publicKey, t target, removeAllDevices bool, deviceSet map[string]struct{}) bool {
+	if t.Source == "github" || t.Source == "gitlab" {
+		return key.Comment == providerComment(t.Source, t.Username)
+	}
+	username, device, ok := splitSSHComment(key.Comment)
+	if !ok || username != t.Username {
+		return false
+	}
+	if removeAllDevices {
+		return true
+	}
+	_, ok = deviceSet[device]
+	return ok
+}
+
+func removeNameForKey(key *publicKey, t target) string {
+	if t.Source == "github" || t.Source == "gitlab" {
+		return t.Source + "/" + t.Username
+	}
+	username, device, ok := splitSSHComment(key.Comment)
+	if !ok {
+		return t.Username
+	}
+	return username + "/" + device
+}
+
+func removedKeyListEntries(keys []*publicKey) []keyLine {
+	out := make([]keyLine, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, keyLine{Key: key})
+	}
+	return out
+}
+
+func renderKeyLines(w io.Writer, lines []keyLine) {
+	fmt.Fprintln(w, "SOURCE   NAME              TYPE                 KEY")
+	for _, line := range lines {
+		if line.Key == nil {
+			continue
+		}
+		source, name := keySourceAndName(line.Key)
+		fmt.Fprintf(w, "%-8s %-17s %-20s %s\n", source, name, displayAlgorithm(line.Key.Algorithm), compactKeyData(line.Key.KeyData))
+	}
+}
+
+func keySourceAndName(key *publicKey) (string, string) {
+	source := "LOCAL"
+	name := strings.TrimSpace(key.Comment)
+	if provider, username, ok := splitProviderComment(key.Comment); ok {
+		return strings.ToUpper(provider), username
+	}
+	if username, device, ok := splitSSHComment(key.Comment); ok {
+		return "SSHPUB", username + "/" + device
+	}
+	if name == "" {
+		name = "-"
+	}
+	return source, name
+}
+
+func confirmRemoveKeys(opts removeOptions, t target, plan removePlan) (bool, error) {
+	if opts.Confirm == nil {
+		return false, errors.New("confirmation input is unavailable")
+	}
+	if opts.Prompt != nil {
+		fmt.Fprintf(opts.Prompt, "%d %s will be removed:\n\n", len(plan.RemovedKeys), plural("key", len(plan.RemovedKeys)))
+		renderKeyLines(opts.Prompt, removedKeyListEntries(plan.RemovedKeys))
+		fmt.Fprintln(opts.Prompt)
+		if removeLeavesNoValidKeys(plan) {
+			fmt.Fprintln(opts.Prompt, "Warning: this will leave no valid SSH keys in authorized_keys.")
+			fmt.Fprintln(opts.Prompt)
+		}
+		fmt.Fprintf(opts.Prompt, "%s [y/N]: ", removeConfirmQuestion(t, len(plan.RemovedKeys)))
+	}
+	line, err := bufio.NewReader(opts.Confirm).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes", nil
+}
+
+func removeLeavesNoValidKeys(plan removePlan) bool {
+	return plan.WouldRemoveAnyValid && plan.RemainingValidKeys == 0
+}
+
+func removeConfirmQuestion(t target, count int) string {
+	if t.Source == "github" || t.Source == "gitlab" {
+		return fmt.Sprintf("Remove %d %s %s for %s?", count, providerDisplayName(t.Source), plural("key", count), t.Username)
+	}
+	return fmt.Sprintf("Remove %d %s for %s?", count, plural("key", count), targetDisplayName(t))
+}
+
+func targetDisplayName(t target) string {
+	if t.Source == "github" || t.Source == "gitlab" {
+		return t.Source + "/" + t.Username
+	}
+	if len(t.Devices) == 0 {
+		return t.Username
+	}
+	return joinQualified(t.Username, t.Devices)
 }
 
 func isEffectiveAuthorizedKeyLine(line string) bool {
@@ -679,23 +1115,6 @@ func isEffectiveAuthorizedKeyLine(line string) bool {
 	return !strings.Contains(pub.Type(), "-cert-v01@openssh.com")
 }
 
-func confirmRemoveAllKeys(opts removeOptions, path string) (bool, error) {
-	if opts.Confirm == nil {
-		return false, errors.New("confirmation input is unavailable")
-	}
-	if opts.Prompt != nil {
-		fmt.Fprintf(opts.Prompt, "Warning: this operation will remove all SSH keys from: %s\n", path)
-		fmt.Fprintln(opts.Prompt, "You may lose SSH access to this account.")
-		fmt.Fprintln(opts.Prompt)
-		fmt.Fprint(opts.Prompt, "Continue? [y/N]: ")
-	}
-	line, err := bufio.NewReader(opts.Confirm).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, err
-	}
-	return strings.EqualFold(strings.TrimSpace(line), "y"), nil
-}
-
 func isInteractive(file *os.File) bool {
 	info, err := file.Stat()
 	if err != nil {
@@ -709,22 +1128,7 @@ func listKeys(w io.Writer, path string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, "SOURCE   NAME              TYPE                 KEY")
-	for _, line := range lines {
-		if line.Key == nil {
-			continue
-		}
-		source := "LOCAL"
-		name := strings.TrimSpace(line.Key.Comment)
-		if username, device, ok := splitSSHComment(line.Key.Comment); ok {
-			source = "SSHPUB"
-			name = username + "/" + device
-		}
-		if name == "" {
-			name = "-"
-		}
-		fmt.Fprintf(w, "%-8s %-17s %-20s %s\n", source, name, displayAlgorithm(line.Key.Algorithm), compactKeyData(line.Key.KeyData))
-	}
+	renderKeyLines(w, lines)
 	return nil
 }
 
@@ -795,6 +1199,13 @@ func appendAuthorizedKeyLines(original []byte, additions []string) []byte {
 	return out
 }
 
+func joinAuthorizedKeyLines(lines []string) []byte {
+	if len(lines) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(lines, "\n") + "\n")
+}
+
 func splitPreserveLines(data string) []string {
 	data = strings.TrimSuffix(data, "\n")
 	data = strings.TrimSuffix(data, "\r")
@@ -807,16 +1218,28 @@ func splitPreserveLines(data string) []string {
 func printAddResult(w io.Writer, result addResult) {
 	sort.Strings(result.Added)
 	sort.Strings(result.Exists)
-	if len(result.Added) == 0 {
+	result.Updated = uniqueSorted(result.Updated)
+	if len(result.Added) == 0 && len(result.Updated) == 0 {
 		fmt.Fprintln(w, "No keys added.")
 		if len(result.Exists) > 0 {
 			fmt.Fprintln(w, "All requested keys already exist.")
 		}
 		return
 	}
-	fmt.Fprintf(w, "Added %d %s:\n\n", len(result.Added), plural("key", len(result.Added)))
-	for _, name := range result.Added {
-		fmt.Fprintln(w, name)
+	if len(result.Updated) > 0 {
+		fmt.Fprintf(w, "Updated %d %s:\n\n", len(result.Updated), plural("key", len(result.Updated)))
+		for _, name := range result.Updated {
+			fmt.Fprintln(w, name)
+		}
+	}
+	if len(result.Added) > 0 {
+		if len(result.Updated) > 0 {
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintf(w, "Added %d %s:\n\n", len(result.Added), plural("key", len(result.Added)))
+		for _, name := range result.Added {
+			fmt.Fprintln(w, name)
+		}
 	}
 	if len(result.Exists) > 0 {
 		fmt.Fprint(w, "\nAlready exists:\n\n")
@@ -828,7 +1251,7 @@ func printAddResult(w io.Writer, result addResult) {
 
 func printRemoveResult(w io.Writer, removed []string) {
 	if len(removed) == 0 {
-		fmt.Fprintln(w, "No matching SSH Pub keys found.")
+		fmt.Fprintln(w, "No matching keys found.")
 		return
 	}
 	fmt.Fprintf(w, "Removed %d %s:\n\n", len(removed), plural("key", len(removed)))

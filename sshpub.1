@@ -1,4 +1,4 @@
-.TH SSHPUB 1 "September 2026" "sshpub 0.1.1" "User Commands"
+.TH SSHPUB 1 "September 2026" "sshpub 0.2.0" "User Commands"
 .SH NAME
 sshpub \- download and manage SSH Pub public keys in authorized_keys
 .SH SYNOPSIS
@@ -8,11 +8,27 @@ sshpub \- download and manage SSH Pub public keys in authorized_keys
 .B sshpub add
 .I user/device[,device...]
 .br
+.B sshpub add
+.I github/user
+.br
+.B sshpub add
+.I gitlab/user
+.br
 .B sshpub remove
 .I user
+.RI [ -y | --yes ]
 .br
 .B sshpub remove
 .I user/device[,device...]
+.RI [ -y | --yes ]
+.br
+.B sshpub remove
+.I github/user
+.RI [ -y | --yes ]
+.br
+.B sshpub remove
+.I gitlab/user
+.RI [ -y | --yes ]
 .br
 .B sshpub list
 .br
@@ -34,14 +50,31 @@ Download all enabled public keys for the user and add any missing keys.
 Download one or more device keys. The server must not return keys for devices
 that were not requested.
 .TP
+.B add github/user
+Download the user's public GitHub SSH keys and add missing keys only.
+.TP
+.B add gitlab/user
+Download the user's public GitLab SSH keys usable for SSH authentication and add
+missing keys only.
+.TP
 .B remove user
 Remove all local SSH Pub-managed keys for the user.
 .TP
 .B remove user/device[,device...]
 Remove local SSH Pub-managed keys for the selected devices.
 .TP
+.B remove github/user
+Remove all local keys marked as belonging to that GitHub source group.
+.TP
+.B remove gitlab/user
+Remove all local keys marked as belonging to that GitLab source group.
+.TP
+.B -y, --yes
+Skip the remove confirmation prompt after matching keys have been calculated.
+.TP
 .B list
-List all valid public keys in authorized_keys and label them as SSHPUB or LOCAL.
+List all valid public keys in authorized_keys and label them as LOCAL, SSHPUB,
+GITHUB, or GITLAB.
 .TP
 .B version
 Print the sshpub version.
@@ -53,8 +86,9 @@ binary.
 .SH SECURITY
 The CLI validates downloaded keys with golang.org/x/crypto/ssh, rejects
 authorized_keys options, accepts only allowlisted ordinary SSH public key
-algorithms, rejects OpenSSH certificates, verifies SSH Pub comments, and writes
-authorized_keys atomically only after all validation succeeds.
+algorithms, rejects OpenSSH certificates, verifies managed comments, confirms
+remove operations by default, and writes authorized_keys atomically only after
+all validation succeeds.
 .PP
 The CLI does not provide SSH login, run a daemon or agent, collect telemetry,
 automatically check for updates, automatically update itself, or modify sshd
